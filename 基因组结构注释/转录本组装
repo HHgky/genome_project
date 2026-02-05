@@ -1,0 +1,260 @@
+#!/bin/bash
+set -euo pipefail
+
+############################################
+# 0) 全局配置（按需改）
+############################################
+GENOME_ROOT="/public1/home/stu_hehao/work/data/genome"
+QUEUE="comput"
+THREADS=4
+
+# dUTP 反向链特异性：HISAT2 用 RF；StringTie 用 --rf
+HISAT2_STRAND="RF"
+STRINGTIE_STRAND="--rf"   # 非链特异性文库：改为空 STRINGTIE_STRAND=""
+
+SPECIES_LIST=(
+  "Coatitermes_aff.kartaboensis_FG20-LS-smal"
+)
+
+############################################
+# 1) 工具函数：自动提取统一特征路径
+############################################
+pick_genome_fa() {
+  local sp_dir="$1"
+  local fa=""
+  fa="$(ls -1 "${sp_dir}"/*.fna 2>/dev/null | head -n 1 || true)"
+  [[ -z "${fa}" ]] && fa="$(ls -1 "${sp_dir}"/*.fa 2>/dev/null | head -n 1 || true)"
+  [[ -z "${fa}" ]] && fa="$(ls -1 "${sp_dir}"/*.fasta 2>/dev/null | head -n 1 || true)"
+  [[ -z "${fa}" ]] && return 1
+  echo "${fa}"
+}
+
+pick_fastq_dir() {
+  local sp_dir="$1"
+  local fq=""
+  fq="$(ls -d "${sp_dir}"/RUN_*_maker/00_fastp 2>/dev/null | head -n 1 || true)"
+  [[ -z "${fq}" ]] && fq="$(find "${sp_dir}" -maxdepth 3 -type d -name "00_fastp" 2>/dev/null | head -n 1 || true)"
+  [[ -z "${fq}" ]] && return 1
+  echo "${fq}"
+}
+
+############################################
+# 2) 输出 PBS 脚本存放目录（统一放一个地方）
+############################################
+TS="$(date +%Y%m%d_%H%M%S)"
+PBS_OUTDIR="${GENOME_ROOT}/pbs_jobs_hs2st_${TS}"
+mkdir -p "${PBS_OUTDIR}"
+
+echo "[INFO] PBS_OUTDIR=${PBS_OUTDIR}"
+
+############################################
+# 3) 为每个物种生成 PBS 并提交
+############################################
+idx=0
+for sp in "${SPECIES_LIST[@]}"; do
+  idx=$((idx+1))
+  sp_dir="${GENOME_ROOT}/${sp}"
+
+  if [[ ! -d "${sp_dir}" ]]; then
+    echo "[SKIP] 目录不存在: ${sp_dir}" >&2
+    continue
+  fi
+
+  genome_fa="$(pick_genome_fa "${sp_dir}")" || { echo "[SKIP] 未找到基因组FASTA: ${sp_dir}" >&2; continue; }
+  fastq_dir="$(pick_fastq_dir "${sp_dir}")" || { echo "[SKIP] 未找到00_fastp: ${sp_dir}" >&2; continue; }
+
+  jobid="$(printf "%03d" "${idx}")"
+  pbs_file="${PBS_OUTDIR}/${jobid}.pbs"
+
+  cat > "${pbs_file}" <<EOF
+#!/bin/bash
+#PBS -N his
+#PBS -l nodes=1:ppn=${THREADS}
+#PBS -q ${QUEUE}
+#PBS -l mem=
+#PBS -o ${jobid}.pbs.out
+#PBS -j oe
+
+set -eo pipefail
+cd "\$PBS_O_WORKDIR"
+
+# conda 激活阶段避免 nounset 报错（你之前遇到 ADDR2LINE）
+source ~/miniconda3/bin/activate
+set +u
+conda activate note
+set -u
+set -eo pipefail
+
+########################################
+# 固定参数（由生成器写入）
+########################################
+THREADS=${THREADS}
+SPECIES="${sp}"
+SPECIES_DIR="${sp_dir}"
+GENOME_FA="${genome_fa}"
+FASTQ_DIR="${fastq_dir}"
+
+HISAT2_STRAND="${HISAT2_STRAND}"
+STRINGTIE_STRAND="${STRINGTIE_STRAND}"
+
+########################################
+# 本次运行输出目录（唯一，防覆盖）
+########################################
+RUN_ID="\$(date +%Y%m%d_%H%M%S)"
+OUT_ROOT="\${SPECIES_DIR}/transcript_assembly"
+RUN_DIR="\${OUT_ROOT}/RUN_\${RUN_ID}"
+mkdir -p "\${RUN_DIR}"
+cd "\${RUN_DIR}"
+
+mkdir -p 00_ref 01_align 02_stringtie 03_merge logs 99_list
+
+echo "[INFO] SPECIES=\${SPECIES}"
+echo "[INFO] SPECIES_DIR=\${SPECIES_DIR}"
+echo "[INFO] GENOME_FA=\${GENOME_FA}"
+echo "[INFO] FASTQ_DIR=\${FASTQ_DIR}"
+echo "[INFO] RUN_DIR=\${RUN_DIR}"
+echo "[INFO] THREADS=\${THREADS}"
+
+########################################
+# 1) 自动识别全部样本对（兼容 fq.gz / fastq.gz；兼容 clean 或非 clean）
+########################################
+PAIR_TSV="99_list/samples_all_pairs.tsv"
+: > "\${PAIR_TSV}"
+
+shopt -s nullglob
+
+# 优先识别 clean 命名；若不存在则识别非 clean
+R1_FILES=( "\${FASTQ_DIR}"/*_clean_1.f*q.gz )
+if [[ "\${#R1_FILES[@]}" -eq 0 ]]; then
+  R1_FILES=( "\${FASTQ_DIR}"/*_1.f*q.gz )
+fi
+
+shopt -u nullglob
+
+if [[ "\${#R1_FILES[@]}" -eq 0 ]]; then
+  echo "[ERROR] 未找到可识别的R1：\${FASTQ_DIR} (期望 *_clean_1.fq.gz 或 *_clean_1.fastq.gz 或 *_1.fq.gz 或 *_1.fastq.gz)" >&2
+  exit 1
+fi
+
+IFS=\$'\\n' R1_FILES=(\$(printf "%s\\n" "\${R1_FILES[@]}" | sort))
+unset IFS
+
+valid=0
+missing=0
+
+for r1 in "\${R1_FILES[@]}"; do
+  # 配对：把 _clean_1 或 _1 替换成 _clean_2 或 _2（同时兼容）
+  r2="\${r1/_clean_1/_clean_2}"
+  if [[ "\${r2}" == "\${r1}" ]]; then
+    r2="\${r1/_1/_2}"
+  fi
+
+  if [[ ! -s "\${r2}" ]]; then
+    echo "[WARN] 缺失/为空：\${r2}（与 \${r1} 配对），跳过" >&2
+    missing=\$((missing+1))
+    continue
+  fi
+
+  base="\$(basename "\${r1}")"
+
+  # 样本名：去掉 _clean_1.(fq|fastq).gz 或 _1.(fq|fastq).gz
+  sample="\$(echo "\${base}" | sed -E 's/(_clean)?_1\\.(f(ast)?q)\\.gz\$//')"
+
+  printf "%s\\t%s\\t%s\\n" "\${sample}" "\${r1}" "\${r2}" >> "\${PAIR_TSV}"
+  valid=\$((valid+1))
+done
+
+if [[ "\${valid}" -eq 0 ]]; then
+  echo "[ERROR] 没有有效配对样本（R2 缺失/为空）" >&2
+  exit 1
+fi
+
+echo "[INFO] valid_pairs=\${valid} missing_pairs=\${missing}"
+echo "[INFO] PAIR_TSV=\${RUN_DIR}/\${PAIR_TSV}"
+
+########################################
+# 2) HISAT2-build（本次RUN独立索引）
+########################################
+IDX_DIR="00_ref/hisat2_index"
+mkdir -p "\${IDX_DIR}"
+IDX_PREFIX="\${IDX_DIR}/genome"
+
+hisat2-build -p "\${THREADS}" "\${GENOME_FA}" "\${IDX_PREFIX}" \
+  1> "logs/hisat2-build.stdout.log" \
+  2> "logs/hisat2-build.stderr.log"
+
+########################################
+# 3) HISAT2 → sort → index
+########################################
+while IFS=\$'\\t' read -r SAMPLE R1 R2; do
+  [[ -z "\${SAMPLE}" ]] && continue
+
+  SDIR="01_align/\${SAMPLE}"
+  mkdir -p "\${SDIR}"
+
+  OUT_BAM="\${SDIR}/\${SAMPLE}.rnaseq.bam"
+  SUM_FILE="\${SDIR}/\${SAMPLE}.rnaseq.hisat.summary"
+  LOG_STD="\${SDIR}/\${SAMPLE}.hisat2.log"
+  LOG_ERR="\${SDIR}/\${SAMPLE}.hisat2.err"
+
+  hisat2 \
+    --dta \
+    --new-summary \
+    --summary-file "\${SUM_FILE}" \
+    --threads "\${THREADS}" \
+    --rna-strandness "\${HISAT2_STRAND}" \
+    -x "\${IDX_PREFIX}" \
+    -1 "\${R1}" \
+    -2 "\${R2}" | \
+    samtools sort -@ "\${THREADS}" -o "\${OUT_BAM}" - \
+      1> "\${LOG_STD}" \
+      2> "\${LOG_ERR}"
+
+  samtools index "\${OUT_BAM}"
+done < "\${PAIR_TSV}"
+
+########################################
+# 4) StringTie 逐样本组装 + merge
+########################################
+GTF_LIST="03_merge/gtf_files.txt"
+: > "\${GTF_LIST}"
+
+while IFS=\$'\\t' read -r SAMPLE R1 R2; do
+  [[ -z "\${SAMPLE}" ]] && continue
+
+  IN_BAM="01_align/\${SAMPLE}/\${SAMPLE}.rnaseq.bam"
+  OUT_DIR="02_stringtie/\${SAMPLE}"
+  mkdir -p "\${OUT_DIR}"
+
+  OUT_GTF="\${OUT_DIR}/\${SAMPLE}.stringtie.gtf"
+
+  stringtie "\${IN_BAM}" \
+    -p "\${THREADS}" \
+    \${STRINGTIE_STRAND} \
+    -o "\${OUT_GTF}" \
+    1> "\${OUT_DIR}/\${SAMPLE}.stringtie.stdout.log" \
+    2> "\${OUT_DIR}/\${SAMPLE}.stringtie.stderr.log"
+
+  echo "\${RUN_DIR}/\${OUT_GTF}" >> "\${GTF_LIST}"
+done < "\${PAIR_TSV}"
+
+MERGED_GTF="03_merge/merged_transcripts.gtf"
+stringtie --merge \
+  -p "\${THREADS}" \
+  -o "\${MERGED_GTF}" \
+  "\${GTF_LIST}" \
+  1> "03_merge/stringtie_merge.stdout.log" \
+  2> "03_merge/stringtie_merge.stderr.log"
+
+echo "[DONE] SPECIES=\${SPECIES}"
+echo "[DONE] RUN_DIR=\${RUN_DIR}"
+echo "[DONE] MERGED_GTF=\${RUN_DIR}/\${MERGED_GTF}"
+EOF
+
+  chmod +x "${pbs_file}"
+  echo "[GEN] ${pbs_file}"
+  qsub "${pbs_file}"
+  echo "[SUBMIT] ${sp} -> ${pbs_file}"
+done
+
+echo "[ALL SUBMITTED] PBS scripts in: ${PBS_OUTDIR}"

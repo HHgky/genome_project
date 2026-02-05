@@ -1,0 +1,170 @@
+
+#!/bin/bash
+set -euo pipefail
+
+BASE="/public1/home/stu_hehao/work/data/genome"
+PROT_SEQ="/public1/home/stu_hehao/work/data/db/merged.fasta"
+
+PPN=15
+THREADS=15
+MEM="500gb"
+QUEUE="comput"
+
+STAMP="$(date +%Y%m%d_%H%M%S)"
+JOBDIR="${BASE}/pbs_jobs/jgzs_${STAMP}"
+mkdir -p "${JOBDIR}"
+
+# ====== 你指定要跑的物种目录名（与 genome/ 下目录一致）======
+SPECIES_LIST=(
+  "Coatitermes_aff.kartaboensis_FG20-LS-smal"
+)
+# =====================================================================
+
+[[ -s "${PROT_SEQ}" ]] || { echo "[ERROR] PROT_SEQ not found/empty: ${PROT_SEQ}"; exit 1; }
+
+for sp in "${SPECIES_LIST[@]}"; do
+  spdir="${BASE}/${sp}"
+  if [[ ! -d "${spdir}" ]]; then
+    echo "[SKIP] ${sp}: species dir not found: ${spdir}"
+    continue
+  fi
+
+  # 基因组：优先 ${sp}.fna，否则取目录内第一个 .fna/.fa/.fasta
+  genome=""
+  for f in "${spdir}/${sp}.fna" "${spdir}/${sp}.fa" "${spdir}/${sp}.fasta"; do
+    [[ -f "${f}" ]] && genome="${f}" && break
+  done
+  if [[ -z "${genome}" ]]; then
+    genome="$(ls "${spdir}"/*.fna "${spdir}"/*.fa "${spdir}"/*.fasta 2>/dev/null | head -n 1 || true)"
+  fi
+  if [[ -z "${genome}" ]]; then
+    echo "[SKIP] ${sp}: genome fasta not found"
+    continue
+  fi
+
+  # fastp 目录：优先 RUN_${sp}_maker/00_fastp；若不存在则取最新的 RUN_*_maker/00_fastp
+  fastp_dir="${spdir}/RUN_${sp}_maker/00_fastp"
+  if [[ ! -d "${fastp_dir}" ]]; then
+    fastp_dir="$(ls -dt "${spdir}"/RUN_*_maker/00_fastp 2>/dev/null | head -n 1 || true)"
+  fi
+  if [[ -z "${fastp_dir}" || ! -d "${fastp_dir}" ]]; then
+    echo "[SKIP] ${sp}: fastp dir not found (RUN_*_maker/00_fastp)"
+    continue
+  fi
+
+  # 检查是否存在 *_clean_1.fq.gz
+  if ! ls "${fastp_dir}"/*_clean_1.fq.gz >/dev/null 2>&1; then
+    echo "[SKIP] ${sp}: no *_clean_1.fq.gz found in ${fastp_dir}"
+    continue
+  fi
+
+  pbs="${JOBDIR}/map_${sp}_${STAMP}.pbs"
+
+  cat > "${pbs}" <<EOF
+#!/bin/bash
+#PBS -N sRNA
+#PBS -l nodes=1:ppn=${PPN}
+#PBS -q ${QUEUE}
+#PBS -l mem=${MEM}
+#PBS -o ${JOBDIR}/map_${sp}_${STAMP}.pbs.log
+#PBS -j oe
+
+cd ${spdir} || exit 1
+source ~/miniconda3/bin/activate
+conda activate note
+
+SPECIES_NAME="${sp}"
+GENOME_IN="${genome}"
+PROT_SEQ="${PROT_SEQ}"
+THREADS=${THREADS}
+FASTP_DIR="${fastp_dir}"
+
+RUN_ID="\${SPECIES_NAME}_\$(date +%Y%m%d_%H%M%S)"
+OUTDIR="/public1/home/stu_hehao/work/data/genome/\${SPECIES_NAME}/RUN_\${RUN_ID}"
+mkdir -p "\${OUTDIR}"
+cd "\${OUTDIR}" || exit 1
+
+echo "[INFO] OUTDIR=\${OUTDIR}"
+echo "[INFO] GENOME_IN=\${GENOME_IN}"
+echo "[INFO] PROT_SEQ=\${PROT_SEQ}"
+echo "[INFO] FASTP_DIR=\${FASTP_DIR}"
+ls -lh "\${GENOME_IN}" "\${PROT_SEQ}" || exit 2
+ls -lh "\${FASTP_DIR}" | head || exit 3
+echo
+
+# -------------------- 1) 生成 genome id-only（只保留 > 后第一列） --------------------
+mkdir -p 00_genome_idonly
+GENOME_IDONLY="\${OUTDIR}/00_genome_idonly/genome.idonly.fa"
+
+awk '
+  /^>/{sub(/^>/,""); split(\$0,a,/[\t ]+/); print ">"a[1]; next}
+  {print}
+' "\${GENOME_IN}" > "\${GENOME_IDONLY}"
+
+samtools faidx "\${GENOME_IDONLY}"
+
+# -------------------- 2) 识别 fastp clean 双端（*_clean_1.fq.gz / *_clean_2.fq.gz）并建链接目录 --------------------
+mkdir -p 01_rnaseq_links
+LINK_DIR="\${OUTDIR}/01_rnaseq_links"
+shopt -s nullglob
+
+R1_FILES=( "\${FASTP_DIR}"/*_clean_1.fq.gz )
+
+VALID_IDS=()
+for r1 in "\${R1_FILES[@]}"; do
+  b=\$(basename "\${r1}")
+  id="\${b%_clean_1.fq.gz}"
+
+  r2="\${FASTP_DIR}/\${id}_clean_2.fq.gz"
+  [[ -f "\${r2}" ]] || continue
+
+  ln -sf "\${r1}" "\${LINK_DIR}/\${id}_1.fastq.gz"
+  ln -sf "\${r2}" "\${LINK_DIR}/\${id}_2.fastq.gz"
+  VALID_IDS+=("\${id}")
+done
+
+if [[ \${#VALID_IDS[@]} -gt 0 ]]; then
+  mapfile -t VALID_IDS < <(printf "%s\n" "\${VALID_IDS[@]}" | awk '!seen[\$0]++')
+fi
+
+N_IDS=\${#VALID_IDS[@]}
+if [[ "\${N_IDS}" -eq 0 ]]; then
+  echo "[ERROR] 未检测到成对的 *_clean_1.fq.gz 与 *_clean_2.fq.gz"
+  exit 4
+fi
+
+RNASEQ_IDS=\$(IFS=,; echo "\${VALID_IDS[*]}")
+RNASEQ_DIRS=\$(yes "\${LINK_DIR}" | head -n "\${N_IDS}" | paste -sd, -)
+
+echo "[INFO] Detected RNA-seq sets: \${N_IDS}"
+echo "[INFO] rnaseq_sets_ids=\${RNASEQ_IDS}"
+echo "[INFO] rnaseq_sets_dirs=\${RNASEQ_DIRS}"
+echo "[INFO] Example links:"
+ls -lh "\${LINK_DIR}" | head
+echo
+
+# -------------------- 3) 运行 BRAKER3（ETP模式，多组RNA-seq自动整合） --------------------
+mkdir -p 02_braker
+
+braker.pl \\
+  --genome="\${GENOME_IDONLY}" \\
+  --species="\${SPECIES_NAME}_\${RUN_ID}" \\
+  --prot_seq="\${PROT_SEQ}" \\
+  --rnaseq_sets_ids="\${RNASEQ_IDS}" \\
+  --rnaseq_sets_dirs="\${RNASEQ_DIRS}" \\
+  --threads="\${THREADS}" \\
+  --workingdir="\${OUTDIR}/02_braker/braker_work" \\
+  --gff3 \\
+  1> "\${OUTDIR}/02_braker/braker.stdout.log" \\
+  2> "\${OUTDIR}/02_braker/braker.stderr.log"
+
+echo "[INFO] DONE. Results in \${OUTDIR}/02_braker/braker_work"
+EOF
+
+  echo "[SUBMIT] ${sp} -> ${pbs}"
+  qsub "${pbs}"
+done
+
+echo "[INFO] All done. PBS saved in: ${JOBDIR}"
+
+
