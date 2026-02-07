@@ -1,0 +1,95 @@
+#!/bin/bash
+#PBS -N 1
+#PBS -l nodes=1:ppn=10
+#PBS -q comput
+#PBS -l mem=
+#PBS -o BUSCO.pbs.log
+#PBS -j oe
+
+set -euo pipefail
+
+THREADS=10
+
+GENOME_BASE="/public1/home/stu_hehao/work/data/genome"
+LIST_TXT="/public1/home/stu_hehao/work/data/genome/braker_aa_paths.txt"
+LINEAGE_DIR="/public1/home/stu_hehao/work/data/db/insecta_odb10"
+OUT_ROOT="${GENOME_BASE}/BUSCO"
+mkdir -p "$OUT_ROOT"
+
+# 去掉 Windows CRLF
+sed -i 's/\r$//' "$LIST_TXT"
+
+# ====== 不改你原先能跑的环境方式：mambaforge 的 BUSCO ======
+set +u
+source /share1/biosoft/mambaforge/bin/activate
+conda activate BUSCO
+set -u
+
+STAMP=$(date +%Y%m%d_%H%M%S)
+SUMMARY="${OUT_ROOT}/BUSCO_proteins_summary_${STAMP}.tsv"
+echo -e "Species\tAA\tBUSCO_line\tshort_summary" > "$SUMMARY"
+
+echo "[INFO] LIST_TXT=$LIST_TXT"
+echo "[INFO] LINEAGE_DIR=$LINEAGE_DIR"
+echo "[INFO] OUT_ROOT=$OUT_ROOT"
+echo "[INFO] THREADS=$THREADS"
+echo "[INFO] SUMMARY=$SUMMARY"
+echo
+
+# 抽取 short_summary 行
+extract_line () {
+  grep -Eo 'C:[0-9.]+%\[S:[0-9.]+%,D:[0-9.]+%\],F:[0-9.]+%,M:[0-9.]+%,n:[0-9]+' "$1" | head -n 1 || true
+}
+
+while IFS= read -r AA || [ -n "$AA" ]; do
+  AA="$(echo "$AA" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+  [ -z "$AA" ] && continue
+  echo "$AA" | grep -q '^#' && continue
+  echo "$AA" | grep -q 'braker\.aa$' || continue
+
+  if [ ! -s "$AA" ]; then
+    echo "[SKIP] not found/empty: $AA"
+    continue
+  fi
+
+  # ====== 从路径中稳定提取物种名：genome/<species>/RUN_.../02_braker/.../braker.aa ======
+  SPECIES="$(echo "$AA" | sed -n 's#^.*/genome/\([^/]*\)/RUN_.*#\1#p')"
+  if [ -z "${SPECIES:-}" ]; then
+    echo "[SKIP] cannot parse species from path: $AA"
+    continue
+  fi
+
+  RUN_DIR="${OUT_ROOT}/${SPECIES}/BUSCO_${STAMP}"
+  mkdir -p "$RUN_DIR"
+
+  echo "[RUN] $SPECIES"
+  echo "      AA=$AA"
+  echo "      OUT=$RUN_DIR"
+  echo
+
+  # 关键：每个物种 OUTDIR 不同；任务名固定 proteins 也没问题，因为 out_path 不同
+  busco \
+    -i "$AA" \
+    -l "$LINEAGE_DIR" \
+    -m proteins \
+    --cpu "$THREADS" \
+    --out_path "$RUN_DIR" \
+    -o proteins \
+    --offline \
+    1> "${RUN_DIR}/proteins.stdout.log" \
+    2> "${RUN_DIR}/proteins.stderr.log"
+
+  SS="$(find "${RUN_DIR}/proteins" -maxdepth 2 -type f -name "short_summary*.txt" | head -n 1 || true)"
+  if [ -n "${SS:-}" ] && [ -s "$SS" ]; then
+    LINE="$(extract_line "$SS")"
+    [ -z "${LINE:-}" ] && LINE="NA"
+    echo -e "${SPECIES}\t${AA}\t${LINE}\t${SS}" >> "$SUMMARY"
+  else
+    echo -e "${SPECIES}\t${AA}\tNA\tNA" >> "$SUMMARY"
+  fi
+
+done < "$LIST_TXT"
+
+echo
+echo "[INFO] DONE. Results in: $OUT_ROOT/<species>/BUSCO_${STAMP}/"
+echo "[INFO] Summary table: $SUMMARY"

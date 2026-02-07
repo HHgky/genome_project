@@ -1,0 +1,116 @@
+#!/bin/bash
+#PBS -N fastp_species_parallel
+#PBS -l nodes=1:ppn=30
+#PBS -q comput
+#PBS -l mem=500gb
+#PBS -o fastp_species_parallel.${PBS_JOBID}.log
+#PBS -j oe
+
+cd $PBS_O_WORKDIR
+source ~/miniconda3/bin/activate
+conda activate note
+
+set -euo pipefail
+
+#############################
+# 你需要改的两个地方
+#############################
+TODO_LIST="todo_species.txt"   # 每行一个物种目录名（未处理的）
+ROOT="."                      # 物种目录所在根目录
+#############################
+
+# 你给的 fastp 参数
+FASTP_Q=20
+FASTP_U=30
+FASTP_L=50
+
+# 资源分配：30核同时并行30个物种任务，因此每个物种任务内部 fastp 用1线程
+MAX_JOBS=7
+THREADS=4
+
+# 本次PBS输出独立目录，避免覆盖
+RUNROOT="FASTP_JOB_${PBS_JOBID}_$(date +%Y%m%d_%H%M%S)"
+mkdir -p "${RUNROOT}"
+exec > >(tee -a "${RUNROOT}/run.log") 2>&1
+
+echo "[INFO] PWD=$(pwd)"
+echo "[INFO] ROOT=${ROOT}"
+echo "[INFO] TODO_LIST=${TODO_LIST}"
+echo "[INFO] MAX_JOBS=${MAX_JOBS}"
+echo "[INFO] THREADS(per fastp)=${THREADS}"
+echo "[INFO] FASTP_Q=${FASTP_Q} FASTP_U=${FASTP_U} FASTP_L=${FASTP_L}"
+echo "[INFO] RUNROOT=${RUNROOT}"
+
+if [[ ! -s "${TODO_LIST}" ]]; then
+  echo "[ERROR] TODO_LIST not found or empty: ${TODO_LIST}"
+  exit 1
+fi
+
+run_one_species() {
+  local sp="$1"
+  local sp_dir="${ROOT}/${sp}"
+
+  [[ -d "${sp_dir}" ]] || { echo "[WARN] Skip (no dir): ${sp_dir}"; return 0; }
+
+  # 固定输出结构：物种目录/RUN_物种_maker/00_fastp
+  local RUN="${sp_dir}/RUN_${sp}_maker"
+  mkdir -p "${RUN}/00_fastp"
+
+  echo "[INFO] ===== Species: ${sp} =====" | tee -a "${RUNROOT}/${sp}.species.log"
+
+  shopt -s nullglob
+  local r1_list=( "${sp_dir}"/SRR*_"${sp}"_*_1.fastq.gz )
+  shopt -u nullglob
+
+  if [[ ${#r1_list[@]} -eq 0 ]]; then
+    echo "[WARN] No input fastq found (pattern SRR*_${sp}_*_1.fastq.gz) in ${sp_dir}" | tee -a "${RUNROOT}/${sp}.species.log"
+    return 0
+  fi
+
+  for R1_RAW in "${r1_list[@]}"; do
+    local R2_RAW="${R1_RAW%_1.fastq.gz}_2.fastq.gz"
+    if [[ ! -f "${R2_RAW}" ]]; then
+      echo "[WARN] Missing pair: ${R2_RAW}" | tee -a "${RUNROOT}/${sp}.species.log"
+      continue
+    fi
+
+    local bn1 s
+    bn1="$(basename "${R1_RAW}")"
+    s="${bn1%_1.fastq.gz}"   # 样本前缀：SRRxxxx_species_xxx
+
+    local R1_CLEAN="${RUN}/00_fastp/${s}_clean_1.fastq.gz"
+    local R2_CLEAN="${RUN}/00_fastp/${s}_clean_2.fastq.gz"
+
+    # 已有结果则跳过，避免覆盖
+    if [[ -s "${R1_CLEAN}" && -s "${R2_CLEAN}" ]]; then
+      echo "[INFO] Skip (already done): ${sp} / ${s}" | tee -a "${RUNROOT}/${sp}.species.log"
+      continue
+    fi
+
+    echo "[INFO] fastp: ${sp} / ${s}" | tee -a "${RUNROOT}/${sp}.species.log"
+
+    fastp -w "${THREADS}" --detect_adapter_for_pe \
+      -q "${FASTP_Q}" -u "${FASTP_U}" -l "${FASTP_L}" --trim_poly_g \
+      -i "${R1_RAW}" -I "${R2_RAW}" \
+      -o "${R1_CLEAN}" -O "${R2_CLEAN}" \
+      -h "${RUN}/00_fastp/${s}.fastp.html" -j "${RUN}/00_fastp/${s}.fastp.json" \
+      > "${RUN}/00_fastp/${s}.fastp.stdout.txt" 2> "${RUN}/00_fastp/${s}.fastp.stderr.txt"
+  done
+}
+
+export -f run_one_species
+export ROOT RUNROOT THREADS FASTP_Q FASTP_U FASTP_L
+
+# 读取物种列表（过滤空行/注释）
+mapfile -t SPECIES < <(grep -v '^[[:space:]]*$' "${TODO_LIST}" | grep -v '^[[:space:]]*#')
+
+echo "[INFO] Species count: ${#SPECIES[@]}"
+
+# 并行：一个物种一个任务（最多30个）
+if command -v parallel >/dev/null 2>&1; then
+  parallel -j "${MAX_JOBS}" --no-notice run_one_species ::: "${SPECIES[@]}"
+else
+  printf "%s\n" "${SPECIES[@]}" | xargs -I{} -P "${MAX_JOBS}" bash -lc 'run_one_species "$@"' _ {}
+fi
+
+echo "[INFO] All specified species done."
