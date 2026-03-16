@@ -1,0 +1,256 @@
+#!/bin/bash
+set -e
+set -o pipefail
+
+########################################
+### 基本参数
+########################################
+
+SPECIES=${SPECIES}
+CPU=16
+
+GENOME="${SPECIES}.fna"
+TRANS_GTF="merged_transcripts.gtf"
+BRAKER_GFF="augustus.hints.gff3"
+FINAL_FA="${SPECIES}.transcript.fasta"
+FINAL_GFF="${SPECIES}.gff3"
+FINAL_CDS="${SPECIES}.cds.fasta"
+FINAL_PEP="${SPECIES}.pep.fasta"
+FINAL_GENE="${SPECIES}.gene.fasta"
+FINAL_MRNA="${SPECIES}.mrna.fasta"
+FINAL_LONGEST="${SPECIES}.longest_transcript.fasta"
+
+# 每个物种的 step 标记（循环时互不干扰）
+S0=".${SPECIES}.step0.done"
+S1=".${SPECIES}.step1.done"
+S2=".${SPECIES}.step2.done"
+S3=".${SPECIES}.step3.done"
+S4=".${SPECIES}.step4.done"
+S5=".${SPECIES}.step5.done"
+S6=".${SPECIES}.step6.done"
+S7=".${SPECIES}.step7.done"
+S8=".${SPECIES}.step8.done"
+S9=".${SPECIES}.step9.done"
+S10=".${SPECIES}.step10.done"
+S11=".${SPECIES}.step11.done"
+
+DB_DIR="/home/hehao/pasa_utr/${SPECIES}"
+DB_PATH="${DB_DIR}/pasa_db.sqlite"
+
+########################################
+# Step 0: config 生成（存在则不重写）
+########################################
+if [[ ! -f "$S0" ]]; then
+  mkdir -p "$DB_DIR"
+
+  if [[ ! -s alignAssembly.config ]]; then
+cat > alignAssembly.config << EOF
+DATABASE=/home/hehao/pasa_utr/${SPECIES}/pasa_db.sqlite
+ANNOT_COMPARE_STRICT_CDS_BOUNDARIES=1
+EOF
+  fi
+
+  if [[ ! -s annotCompare.config ]]; then
+cat > annotCompare.config << EOF
+DATABASE=/home/hehao/pasa_utr/${SPECIES}/pasa_db.sqlite
+ANNOT_COMPARE_STRICT_CDS_BOUNDARIES=1
+EOF
+  fi
+
+  touch "$S0"
+fi
+
+########################################
+echo "STEP 0: GTF → transcripts.fa"
+########################################
+if [[ ! -f "$S1" ]]; then
+  if [[ ! -s "$FINAL_FA" ]]; then
+    gffread $TRANS_GTF -g $GENOME -w $FINAL_FA
+  fi
+  touch "$S1"
+fi
+
+########################################
+echo "STEP 1: Initialize PASA database"
+########################################
+if [[ ! -f "$S2" ]]; then
+  # 断点续跑关键：DB 已存在就不要 -C（否则清库重来）
+  CREATE_FLAG=""
+  if [[ ! -s "$DB_PATH" ]]; then
+    CREATE_FLAG="-C"
+  fi
+
+  ~/software/PASApipeline.v2.5.3/Launch_PASA_pipeline.pl \
+    -c alignAssembly.config \
+    $CREATE_FLAG \
+    -R \
+    -g $GENOME \
+    -t $FINAL_FA \
+    --ALIGNERS gmap \
+    --CPU 20
+
+  touch "$S2"
+fi
+
+########################################
+echo "STEP 2: Load gene models"
+########################################
+if [[ ! -f "$S3" ]]; then
+  ~/software/PASApipeline.v2.5.3/scripts/Load_Current_Gene_Annotations.dbi \
+    -c alignAssembly.config \
+    -g $GENOME \
+    -P $BRAKER_GFF
+
+  touch "$S3"
+fi
+
+########################################
+echo "STEP 3: Run PASA annotCompare"
+########################################
+if [[ ! -f "$S4" ]]; then
+  ~/software/PASApipeline.v2.5.3/Launch_PASA_pipeline.pl \
+    -c annotCompare.config \
+    -A \
+    -g $GENOME \
+    -t $FINAL_FA \
+    --CPU $CPU
+
+  touch "$S4"
+fi
+
+########################################
+echo "STEP 4: Collect PASA GFF"
+########################################
+if [[ ! -f "$S5" ]]; then
+  if [[ ! -s v1.update.gff3 ]]; then
+    cat pasa_db.sqlite.gene_structures_post_PASA_updates.*.gff3 \
+      | grep -v "^#" \
+      | sed "/^$/d" \
+      > v1.update.gff3
+  fi
+  touch "$S5"
+fi
+
+########################################
+echo "STEP 5: ORF > 80 aa 过滤"
+########################################
+if [[ ! -f "$S6" ]]; then
+  # 如果目标产物已存在，跳过
+  if [[ ! -s v2.filtered_sup80.gff ]]; then
+    agat_sp_filter_by_ORF_size.pl \
+      --gff v1.update.gff3 \
+      --size 80 \
+      --test ">" \
+      --output v2.filtered
+  fi
+  touch "$S6"
+fi
+
+########################################
+echo "STEP 6: 提取 CDS / PEP"
+########################################
+if [[ ! -f "$S7" ]]; then
+  if [[ ! -s "$FINAL_CDS" ]]; then
+    ~/software/PASApipeline.v2.5.3/misc_utilities/gff3_file_to_proteins.pl \
+      v2.filtered_sup80.gff \
+      $GENOME \
+      CDS > $FINAL_CDS
+  fi
+
+  if [[ ! -s "$FINAL_PEP" ]]; then
+    ~/software/PASApipeline.v2.5.3/misc_utilities/gff3_file_to_proteins.pl \
+      v2.filtered_sup80.gff \
+      $GENOME \
+      prot > $FINAL_PEP
+  fi
+
+  touch "$S7"
+fi
+
+########################################
+echo "STEP 7: 提取 gene / mRNA 序列"
+########################################
+if [[ ! -f "$S8" ]]; then
+  if [[ ! -s "$FINAL_GENE" ]]; then
+    awk 'BEGIN{OFS="\t"}
+$3=="gene"{
+    split($9,a,";");
+    for(i in a){
+        if(a[i] ~ /^ID=/){
+            gsub("ID=","",a[i]);
+            id=a[i]
+        }
+    }
+    print $1,$4-1,$5,id,".",$7
+}' v2.filtered_sup80.gff > gene.bed
+
+    bedtools getfasta \
+      -fi $GENOME \
+      -bed gene.bed \
+      -s \
+      -name \
+      -fo $FINAL_GENE
+  fi
+
+  touch "$S8"
+fi
+
+########################################
+echo "STEP 8: 提取每个基因最长转录本"
+########################################
+if [[ ! -f "$S9" ]]; then
+  if [[ ! -s "$FINAL_LONGEST" ]]; then
+    agat_sp_keep_longest_isoform.pl \
+      --gff v2.filtered_sup80.gff \
+      -o longest.gff
+
+    gffread longest.gff -g $GENOME -w $FINAL_LONGEST
+  fi
+
+  touch "$S9"
+fi
+
+########################################
+echo "STEP 9: 统一 GFF 命名"
+########################################
+if [[ ! -f "$S10" ]]; then
+  if [[ ! -s "$FINAL_GFF" ]]; then
+    cp v2.filtered_sup80.gff $FINAL_GFF
+  fi
+
+  touch "$S10"
+fi
+
+########################################
+echo "STEP 10: 打包"
+########################################
+if [[ ! -f "$S11" ]]; then
+  # 你的 tar 里包含 FINAL_MRNA，但脚本里没生成；这里仅在缺失时补齐（避免 tar 失败）
+  if [[ ! -s "$FINAL_MRNA" ]]; then
+    gffread $FINAL_GFF -g $GENOME -w $FINAL_MRNA
+  fi
+
+  if [[ ! -s ${SPECIES}.tar.gz ]]; then
+    tar -czvf ${SPECIES}.tar.gz \
+      $GENOME \
+      $FINAL_FA \
+      $FINAL_GFF \
+      $FINAL_CDS \
+      $FINAL_PEP \
+      $FINAL_GENE \
+      $FINAL_MRNA \
+      $FINAL_LONGEST
+  fi
+
+  touch "$S11"
+fi
+
+########################################
+echo "STEP 11: 复制到固定路径"
+########################################
+# 复制这步不做 done，因为你可能想强制覆盖；如果你也想断点，自己加一个 .step11.done 即可
+cp -f ${SPECIES}.tar.gz /mnt/g/genome已完成/
+
+echo "======================================="
+echo "PIPELINE FINISHED FOR $SPECIES"
+echo "======================================="

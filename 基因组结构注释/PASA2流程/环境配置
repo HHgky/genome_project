@@ -1,0 +1,85 @@
+环境最好不要单独隔离环境，以免软件模块识别不到，直接安装在base进行
+
+#!/bin/bash
+set -e
+
+# 检查 PASA
+echo "Checking PASA..."
+if ! command -v Launch_PASA_pipeline.pl &> /dev/null; then
+    echo "PASA (Launch_PASA_pipeline.pl) is not installed or not available in PATH"
+else
+    echo "PASA is available"
+fi
+
+# 检查 GMAP
+echo "Checking GMAP..."
+if ! command -v gmap &> /dev/null; then
+    echo "GMAP is not installed or not available in PATH"
+else
+    echo "GMAP is available"
+fi
+
+# 检查 gffread
+echo "Checking gffread..."
+if ! command -v gffread &> /dev/null; then
+    echo "gffread is not installed or not available in PATH"
+else
+    echo "gffread is available"
+fi
+
+# 检查 AGAT
+echo "Checking AGAT..."
+if ! command -v agat_sp_filter_by_ORF_size.pl &> /dev/null; then
+    echo "AGAT is not installed or not available in PATH"
+else
+    echo "AGAT is available"
+fi
+
+# 检查 BEDTools
+echo "Checking BEDTools..."
+if ! command -v bedtools &> /dev/null; then
+    echo "BEDTools is not installed or not available in PATH"
+else
+    echo "BEDTools is available"
+fi
+
+
+# 检查 BLAST
+echo "Checking BLAST..."
+if ! command -v blastn &> /dev/null; then
+    echo "BLAST is not installed or not available in PATH"
+else
+    echo "BLAST is available"
+fi
+
+# 检查 SQLite3
+echo "Checking SQLite3..."
+if ! command -v sqlite3 &> /dev/null; then
+    echo "SQLite3 is not installed or not available in PATH"
+else
+    echo "SQLite3 is available"
+fi
+
+# 检查 Perl 模块 DBD::SQLite
+echo "Checking Perl module DBD::SQLite..."
+perl -MDBD::SQLite -e 1 || echo "Perl module DBD::SQLite is not installed"
+
+# 检查 Perl 模块 File::ShareDir
+echo "Checking Perl module File::ShareDir..."
+perl -MFile::ShareDir -e 1 || echo "Perl module File::ShareDir is not installed"
+
+# 检查 Perl 模块 Term::ProgressBar
+echo "Checking Perl module Term::ProgressBar..."
+perl -MTerm::ProgressBar -e 1 || echo "Perl module Term::ProgressBar is not installed"
+
+# 检查 Perl 模块 File::Path
+echo "Checking Perl module File::Path..."
+perl -MFile::Path -e 1 || echo "Perl module File::Path is not installed"
+
+echo "====================="
+echo "Environment check completed!"
+echo "====================="
+
+
+安装fasta3
+安装blat

@@ -1,0 +1,48 @@
+#!/bin/bash
+set -e
+set -o pipefail
+
+########################################
+# 外循环：自动识别物种目录
+########################################
+
+BASE_DIR=$(pwd)
+
+for dir in */ ; do
+
+    # 去掉末尾 /
+    SPECIES=${dir%/}
+
+    # 判断是否是目录
+    if [ -d "$SPECIES" ]; then
+
+        echo "======================================="
+        echo "Processing species: $SPECIES"
+        echo "======================================="
+
+        export SPECIES=$SPECIES
+
+        # 进入物种目录
+        cd "$BASE_DIR/$SPECIES"
+
+        # 判断是否存在主流程脚本
+        if [ -f "$BASE_DIR/run_annotation_full_pipeline.sh" ]; then
+            bash "$BASE_DIR/run_annotation_full_pipeline.sh"
+        else
+            echo "Pipeline script not found!"
+            exit 1
+        fi
+
+        # 回到主目录
+        cd "$BASE_DIR"
+
+        echo "Finished: $SPECIES"
+        echo
+
+    fi
+
+done
+
+echo "======================================="
+echo "ALL SPECIES FINISHED"
+echo "======================================="
